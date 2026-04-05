@@ -106,6 +106,8 @@ UNGIT may be useful to:
 
 It is open source, provided as-is, and shared because it solved a real problem for me.
 
+I may keep improving it when I need to, but I am not treating it as a request-driven product or promising ongoing feature work.
+
 ## In One Line
 
 UNGIT is a way to stay oriented in your own project when speed, complexity, and AI start to pull you off course.
