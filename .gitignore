@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Xcode / SwiftPM build outputs
+.build/
+.build-xcode/
+DerivedData/
+
+# Xcode user state
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcuserdata/
+
+# Local UNGIT project data
+.ungit/
+
+# Logs
+*.log
+

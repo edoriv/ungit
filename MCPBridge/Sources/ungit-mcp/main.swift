@@ -1,0 +1,3 @@
+import UngitMCPBridge
+
+MCPServer().run()
