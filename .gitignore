@@ -13,7 +13,13 @@ DerivedData/
 
 # Local UNGIT project data
 .ungit/
+AGENTS.md
+BUGS.md
+IDEAS.md
+PARK.md
+PROJECT_SUMMARY.md
+RESTORE_DRILLS.md
+TODO.md
 
 # Logs
 *.log
-
