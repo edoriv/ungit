@@ -26,6 +26,11 @@ struct SnapshotInspectorView: View {
                             .font(.caption)
                             .fontWeight(.medium)
                             .foregroundStyle(.green)
+                    } else if entry.snapshotType == .remoteCorrectionReview {
+                        Label("Continuity Review", systemImage: "doc.text.magnifyingglass")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundStyle(.orange)
                     } else if entry.snapshotType == .releaseCandidate || entry.snapshotType == .release {
                         Label("Sacred Landmark", systemImage: "flag.checkered")
                             .font(.caption)
@@ -34,6 +39,7 @@ struct SnapshotInspectorView: View {
                     }
 
                     inspectorSection("Snapshot Info") {
+                        keyValue("Snapshot ID", entry.id)
                         keyValue("Type", entry.snapshotType.rawValue)
                         keyValue("Status", entry.status.rawValue)
                         keyValue("Proof State", entry.proofVerificationStatus.rawValue)
@@ -73,6 +79,77 @@ struct SnapshotInspectorView: View {
                     }
 
                     if let manifest {
+                        inspectorSection("Remote") {
+                            keyValue("Publish State", manifest.remoteMetadata.publishState.rawValue)
+                            keyValue("Branch", manifest.remoteMetadata.branchName ?? "Not Recorded")
+                            keyValue("Commit", manifest.remoteMetadata.commitSHA ?? "Not Recorded")
+                            keyValue("Published At", manifest.remoteMetadata.publishedAt.map { DateFormatters.display.string(from: $0) } ?? "Not Recorded")
+                            keyValue("Last Publish Attempt", manifest.remoteMetadata.lastPublishAttemptAt.map { DateFormatters.display.string(from: $0) } ?? "Never")
+                            if let requestedBy = manifest.remoteMetadata.requestedBy, !requestedBy.isEmpty {
+                                keyValue("Requested By", requestedBy)
+                            }
+                            if let approvedBy = manifest.remoteMetadata.approvedBy, !approvedBy.isEmpty {
+                                keyValue("Approved By", approvedBy)
+                            }
+                            if let executedBy = manifest.remoteMetadata.executedBy, !executedBy.isEmpty {
+                                keyValue("Executed By", executedBy)
+                            }
+                            if let lastError = manifest.remoteMetadata.lastPublishError, !lastError.isEmpty {
+                                keyValue("Last Error", lastError)
+                            }
+                        }
+
+                        if let preflight = manifest.remoteMetadata.latestPreflight {
+                            inspectorSection("Publish Preflight") {
+                                keyValue("Publish Allowed", preflight.publishAllowed ? "Yes" : "Blocked")
+                                keyValue("Git Repo", preflight.isGitRepository ? "Yes" : "No")
+                                keyValue("Origin Remote", preflight.originRemoteURL ?? "Missing")
+                                keyValue("Current Branch", preflight.currentBranch ?? "Missing")
+                                keyValue("Snapshot Is Latest", preflight.snapshotIsLatest ? "Yes" : "No")
+                                keyValue("Drifted Since Snapshot", preflight.workingTreeDriftedSinceSnapshot ? "Yes" : "No")
+                                keyValue("Staged Changes", preflight.stagedChangesPresent ? "Yes" : "No")
+                                keyValue("Unstaged Changes", preflight.unstagedChangesPresent ? "Yes" : "No")
+                                keyValue("Untracked Files", preflight.untrackedFilesPresent ? "Yes" : "No")
+                                keyValue("Ignored Files", preflight.ignoredFilesPresent ? "Yes" : "No")
+                                if !preflight.blockingReasons.isEmpty {
+                                    noteBlock("Blocking Reasons", preflight.blockingReasons.joined(separator: "\n"))
+                                }
+                            }
+                        }
+
+                        if let window = manifest.remoteMetadata.publicationWindow {
+                            inspectorSection("Publication Window") {
+                                keyValue("Previous Published Milestone", window.previousPublishedMilestoneID ?? "None")
+                                keyValue("First Included Snapshot", window.firstIncludedSnapshotID ?? "None")
+                                keyValue("Last Included Snapshot", window.lastIncludedSnapshotID ?? "None")
+                                noteBlock("Included Snapshot IDs", window.includedSnapshotIDs.joined(separator: ", "))
+                                noteBlock("Compiled Changelog", window.compiledChangelog)
+                            }
+                        }
+
+                        if let review = manifest.remoteCorrectionReview {
+                            inspectorSection("Remote Correction Review") {
+                                keyValue("Linked Milestone", review.linkedMilestoneSnapshotID)
+                                keyValue("Reason", review.reasonForReview.rawValue)
+                                keyValue("Remote Path", review.remotePath)
+                                keyValue("Recommendation", review.recommendationLevel.rawValue)
+                                keyValue("Selected Action", review.humanSelectedNextAction.rawValue)
+                                keyValue("Reviewed At", DateFormatters.display.string(from: review.reviewedAt))
+                                if let recommendation = review.codexRecommendation, !recommendation.isEmpty {
+                                    noteBlock("Codex Recommendation", recommendation)
+                                }
+                                if !review.changedFiles.isEmpty {
+                                    noteBlock(
+                                        "Changed Files",
+                                        review.changedFiles
+                                            .map { "\($0.status.rawValue): \($0.path)" }
+                                            .joined(separator: "\n")
+                                    )
+                                }
+                                noteBlock("Summary", review.summaryOfRemoteChanges)
+                            }
+                        }
+
                         let hasNotes = !manifest.notes.whatChanged.isEmpty ||
                             !manifest.notes.why.isEmpty ||
                             !manifest.notes.gotchas.isEmpty ||
@@ -138,6 +215,7 @@ struct SnapshotInspectorView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
+                .textSelection(.enabled)
             } else {
                 ContentUnavailableView("No Snapshot Selected", systemImage: "clock.badge.questionmark", description: Text("Choose a snapshot from the timeline."))
                     .padding(30)
@@ -151,6 +229,7 @@ struct SnapshotInspectorView: View {
                 .fontWeight(.semibold)
             Text(value)
                 .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

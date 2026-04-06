@@ -127,7 +127,14 @@ private struct SnapshotRow: View {
                 HStack(spacing: 8) {
                     tag(text: entry.snapshotType.rawValue, color: typeColor)
                     tag(text: entry.status.rawValue, color: statusColor)
-                    tag(text: entry.proofVerificationStatus.rawValue, color: proofColor)
+                    proofTag
+                    if entry.remotePublishState == .published {
+                        tag(text: "Published", color: .indigo)
+                    } else if entry.remotePublishState == .publishing {
+                        tag(text: "Publishing", color: .orange)
+                    } else if entry.remotePublishState == .publishFailed {
+                        tag(text: "Publish Failed", color: .red)
+                    }
                     if !entry.archiveAvailable {
                         tag(text: "Pruned", color: .red)
                     }
@@ -141,6 +148,11 @@ private struct SnapshotRow: View {
                         .font(.caption2)
                         .fontWeight(.medium)
                         .foregroundStyle(.green)
+                } else if entry.snapshotType == .remoteCorrectionReview {
+                    Text("Remote Correction Review")
+                        .font(.caption2)
+                        .fontWeight(.medium)
+                        .foregroundStyle(.orange)
                 } else if entry.snapshotType == .releaseCandidate || entry.snapshotType == .release {
                     Text("Sacred Landmark")
                         .font(.caption2)
@@ -205,6 +217,7 @@ private struct SnapshotRow: View {
         if entry.snapshotType == .releaseCandidate { return .semibold }
         if entry.snapshotType == .release { return .semibold }
         if entry.snapshotType == .trustedRollback { return .medium }
+        if entry.snapshotType == .remoteCorrectionReview { return .medium }
         return isMinor ? .regular : .medium
     }
 
@@ -217,6 +230,9 @@ private struct SnapshotRow: View {
         }
         if entry.snapshotType == .trustedRollback {
             return .green.opacity(0.10)
+        }
+        if entry.snapshotType == .remoteCorrectionReview {
+            return .orange.opacity(0.09)
         }
         return .clear
     }
@@ -231,6 +247,8 @@ private struct SnapshotRow: View {
             return "flag.checkered"
         case .trustedRollback:
             return "shield.fill"
+        case .remoteCorrectionReview:
+            return "doc.text.magnifyingglass"
         case .preChange:
             return "pause.fill"
         case .featureWorks:
@@ -254,6 +272,8 @@ private struct SnapshotRow: View {
             return .green
         case .trustedRollback:
             return .green
+        case .remoteCorrectionReview:
+            return .orange
         case .preChange:
             return .orange
         case .featureWorks:
@@ -293,14 +313,29 @@ private struct SnapshotRow: View {
         }
     }
 
-    private func tag(text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption2)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.14))
-            .foregroundStyle(color)
-            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+    @ViewBuilder
+    private var proofTag: some View {
+        if entry.proofVerificationStatus == .verified && entry.proofVerificationMode == .archive {
+            tag(text: entry.proofVerificationStatus.rawValue, color: proofColor, systemImage: "star.fill")
+        } else {
+            tag(text: entry.proofVerificationStatus.rawValue, color: proofColor)
+        }
+    }
+
+    private func tag(text: String, color: Color, systemImage: String? = nil) -> some View {
+        HStack(spacing: 4) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.caption2.weight(.semibold))
+            }
+            Text(text)
+                .font(.caption2)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(color.opacity(0.14))
+        .foregroundStyle(color)
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 }
 

@@ -60,6 +60,7 @@ struct DaySummaryInspectorView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
+            .textSelection(.enabled)
         }
     }
 
