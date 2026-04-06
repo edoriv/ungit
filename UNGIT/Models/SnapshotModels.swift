@@ -5,6 +5,7 @@ enum SnapshotType: String, Codable, CaseIterable, Identifiable {
     case featureWorks = "Feature Works"
     case trustedRollback = "Trusted Rollback"
     case milestone = "Milestone"
+    case remoteCorrectionReview = "Remote Correction Review"
     case releaseCandidate = "Release Candidate"
     case release = "Release"
     case experiment = "Experiment"
@@ -30,6 +31,55 @@ enum SnapshotType: String, Codable, CaseIterable, Identifiable {
             return false
         }
     }
+}
+
+enum RemotePublishFailureReason: String, Codable {
+    case remotePathDiverged = "Remote Path Diverged"
+    case remoteAuthFailed = "Remote Auth Failed"
+    case remoteMissing = "Remote Missing"
+    case noGitRepository = "No Git Repo"
+    case workspaceDriftDetected = "Workspace Drift Detected"
+    case publishBlocked = "Publish Blocked"
+    case unknown = "Unknown"
+}
+
+enum RemoteCorrectionRecommendationLevel: String, Codable {
+    case safe = "Safe"
+    case caution = "Caution"
+    case risky = "Risky"
+}
+
+enum RemoteCorrectionSelectedAction: String, Codable {
+    case inspectOnly = "Inspect Only"
+    case publishToNewPath = "Publish to New Path"
+    case manualAdoptLater = "Manual Adopt Later"
+    case ignore = "Ignore"
+}
+
+enum RemoteCorrectionFileStatus: String, Codable {
+    case added = "Added"
+    case modified = "Modified"
+    case deleted = "Deleted"
+}
+
+struct RemoteCorrectionChangedFile: Codable, Identifiable {
+    var path: String
+    var status: RemoteCorrectionFileStatus
+
+    var id: String { "\(status.rawValue):\(path)" }
+}
+
+struct RemoteCorrectionReviewRecord: Codable {
+    var linkedMilestoneSnapshotID: String
+    var reasonForReview: RemotePublishFailureReason
+    var remotePath: String
+    var changedFiles: [RemoteCorrectionChangedFile]
+    var summaryOfRemoteChanges: String
+    var codexRecommendation: String?
+    var recommendationLevel: RemoteCorrectionRecommendationLevel
+    var humanSelectedNextAction: RemoteCorrectionSelectedAction
+    var reviewedAt: Date
+    var reviewedAtISO8601: String
 }
 
 enum SnapshotStatus: String, Codable, CaseIterable, Identifiable {
@@ -96,6 +146,137 @@ enum ProofVerificationMode: String, Codable {
         default:
             self = .lightweight
         }
+    }
+}
+
+enum RemotePublishState: String, Codable {
+    case notPublished = "Not Published"
+    case publishing = "Publishing"
+    case published = "Published"
+    case publishFailed = "Publish Failed"
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        switch raw.lowercased() {
+        case "publishing":
+            self = .publishing
+        case "published":
+            self = .published
+        case "publish failed", "failed", "error":
+            self = .publishFailed
+        default:
+            self = .notPublished
+        }
+    }
+}
+
+struct RemotePublishPreflight: Codable {
+    var snapshotID: String
+    var snapshotTitle: String
+    var snapshotType: SnapshotType
+    var isGitRepository: Bool
+    var originRemoteURL: String?
+    var currentBranch: String?
+    var snapshotIsLatest: Bool
+    var workingTreeDriftedSinceSnapshot: Bool
+    var stagedChangesPresent: Bool
+    var unstagedChangesPresent: Bool
+    var untrackedFilesPresent: Bool
+    var ignoredFilesPresent: Bool
+    var publishAllowed: Bool
+    var blockingReasons: [String]
+
+    var hasChangesToPublish: Bool {
+        stagedChangesPresent || unstagedChangesPresent || untrackedFilesPresent
+    }
+}
+
+struct MilestonePublicationWindow: Codable {
+    var previousPublishedMilestoneID: String?
+    var firstIncludedSnapshotID: String?
+    var lastIncludedSnapshotID: String?
+    var includedSnapshotIDs: [String]
+    var compiledChangelog: String
+}
+
+struct SnapshotRemoteMetadata: Codable {
+    var publishState: RemotePublishState
+    var branchName: String?
+    var commitSHA: String?
+    var publishedAt: Date?
+    var publishedAtISO8601: String?
+    var lastPublishAttemptAt: Date?
+    var lastPublishAttemptAtISO8601: String?
+    var lastPublishError: String?
+    var requestedBy: String?
+    var approvedBy: String?
+    var executedBy: String?
+    var latestPreflight: RemotePublishPreflight?
+    var publicationWindow: MilestonePublicationWindow?
+
+    enum CodingKeys: String, CodingKey {
+        case publishState
+        case branchName
+        case commitSHA
+        case publishedAt
+        case publishedAtISO8601
+        case lastPublishAttemptAt
+        case lastPublishAttemptAtISO8601
+        case lastPublishError
+        case requestedBy
+        case approvedBy
+        case executedBy
+        case latestPreflight
+        case publicationWindow
+    }
+
+    init(
+        publishState: RemotePublishState = .notPublished,
+        branchName: String? = nil,
+        commitSHA: String? = nil,
+        publishedAt: Date? = nil,
+        publishedAtISO8601: String? = nil,
+        lastPublishAttemptAt: Date? = nil,
+        lastPublishAttemptAtISO8601: String? = nil,
+        lastPublishError: String? = nil,
+        requestedBy: String? = nil,
+        approvedBy: String? = nil,
+        executedBy: String? = nil,
+        latestPreflight: RemotePublishPreflight? = nil,
+        publicationWindow: MilestonePublicationWindow? = nil
+    ) {
+        self.publishState = publishState
+        self.branchName = branchName
+        self.commitSHA = commitSHA
+        self.publishedAt = publishedAt
+        self.publishedAtISO8601 = publishedAtISO8601
+        self.lastPublishAttemptAt = lastPublishAttemptAt
+        self.lastPublishAttemptAtISO8601 = lastPublishAttemptAtISO8601
+        self.lastPublishError = lastPublishError
+        self.requestedBy = requestedBy
+        self.approvedBy = approvedBy
+        self.executedBy = executedBy
+        self.latestPreflight = latestPreflight
+        self.publicationWindow = publicationWindow
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        publishState = try c.decodeIfPresent(RemotePublishState.self, forKey: .publishState) ?? .notPublished
+        branchName = try c.decodeIfPresent(String.self, forKey: .branchName)
+        commitSHA = try c.decodeIfPresent(String.self, forKey: .commitSHA)
+        publishedAt = try c.decodeIfPresent(Date.self, forKey: .publishedAt)
+        publishedAtISO8601 = try c.decodeIfPresent(String.self, forKey: .publishedAtISO8601)
+        lastPublishAttemptAt = try c.decodeIfPresent(Date.self, forKey: .lastPublishAttemptAt)
+        lastPublishAttemptAtISO8601 = try c.decodeIfPresent(String.self, forKey: .lastPublishAttemptAtISO8601)
+        lastPublishError = try c.decodeIfPresent(String.self, forKey: .lastPublishError)
+        requestedBy = try c.decodeIfPresent(String.self, forKey: .requestedBy)
+        approvedBy = try c.decodeIfPresent(String.self, forKey: .approvedBy)
+        executedBy = try c.decodeIfPresent(String.self, forKey: .executedBy)
+        latestPreflight = try c.decodeIfPresent(RemotePublishPreflight.self, forKey: .latestPreflight)
+        publicationWindow = try c.decodeIfPresent(MilestonePublicationWindow.self, forKey: .publicationWindow)
     }
 }
 
@@ -233,6 +414,8 @@ struct SnapshotManifest: Codable, Identifiable {
     var archivePrunedAtISO8601: String?
     var archivePruneReason: String?
     var archiveLocked: Bool?
+    var remoteMetadata: SnapshotRemoteMetadata
+    var remoteCorrectionReview: RemoteCorrectionReviewRecord?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -254,6 +437,8 @@ struct SnapshotManifest: Codable, Identifiable {
         case archivePrunedAtISO8601
         case archivePruneReason
         case archiveLocked
+        case remoteMetadata
+        case remoteCorrectionReview
     }
 
     init(
@@ -275,7 +460,9 @@ struct SnapshotManifest: Codable, Identifiable {
         archivePrunedAt: Date?,
         archivePrunedAtISO8601: String?,
         archivePruneReason: String?,
-        archiveLocked: Bool?
+        archiveLocked: Bool?,
+        remoteMetadata: SnapshotRemoteMetadata = SnapshotRemoteMetadata(),
+        remoteCorrectionReview: RemoteCorrectionReviewRecord? = nil
     ) {
         self.id = id
         self.projectID = projectID
@@ -296,6 +483,8 @@ struct SnapshotManifest: Codable, Identifiable {
         self.archivePrunedAtISO8601 = archivePrunedAtISO8601
         self.archivePruneReason = archivePruneReason
         self.archiveLocked = archiveLocked
+        self.remoteMetadata = remoteMetadata
+        self.remoteCorrectionReview = remoteCorrectionReview
     }
 
     init(from decoder: Decoder) throws {
@@ -319,6 +508,8 @@ struct SnapshotManifest: Codable, Identifiable {
         archivePrunedAtISO8601 = try c.decodeIfPresent(String.self, forKey: .archivePrunedAtISO8601)
         archivePruneReason = try c.decodeIfPresent(String.self, forKey: .archivePruneReason)
         archiveLocked = try c.decodeIfPresent(Bool.self, forKey: .archiveLocked) ?? false
+        remoteMetadata = try c.decodeIfPresent(SnapshotRemoteMetadata.self, forKey: .remoteMetadata) ?? SnapshotRemoteMetadata()
+        remoteCorrectionReview = try c.decodeIfPresent(RemoteCorrectionReviewRecord.self, forKey: .remoteCorrectionReview)
     }
 }
 
@@ -338,6 +529,8 @@ struct TimelineEntry: Codable, Identifiable {
     var projectFileCount: Int?
     var codeSizeApproxLines: Int?
     var proofVerificationStatus: ProofVerificationStatus
+    var proofVerificationMode: ProofVerificationMode?
+    var remotePublishState: RemotePublishState
     var archiveAvailable: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -356,6 +549,8 @@ struct TimelineEntry: Codable, Identifiable {
         case projectFileCount
         case codeSizeApproxLines
         case proofVerificationStatus
+        case proofVerificationMode
+        case remotePublishState
         case archiveAvailable
     }
 
@@ -375,6 +570,8 @@ struct TimelineEntry: Codable, Identifiable {
         projectFileCount: Int?,
         codeSizeApproxLines: Int?,
         proofVerificationStatus: ProofVerificationStatus,
+        proofVerificationMode: ProofVerificationMode?,
+        remotePublishState: RemotePublishState,
         archiveAvailable: Bool
     ) {
         self.id = id
@@ -392,6 +589,8 @@ struct TimelineEntry: Codable, Identifiable {
         self.projectFileCount = projectFileCount
         self.codeSizeApproxLines = codeSizeApproxLines
         self.proofVerificationStatus = proofVerificationStatus
+        self.proofVerificationMode = proofVerificationMode
+        self.remotePublishState = remotePublishState
         self.archiveAvailable = archiveAvailable
     }
 
@@ -412,6 +611,8 @@ struct TimelineEntry: Codable, Identifiable {
         projectFileCount = try c.decodeIfPresent(Int.self, forKey: .projectFileCount)
         codeSizeApproxLines = try c.decodeIfPresent(Int.self, forKey: .codeSizeApproxLines)
         proofVerificationStatus = try c.decodeIfPresent(ProofVerificationStatus.self, forKey: .proofVerificationStatus) ?? .unverified
+        proofVerificationMode = try c.decodeIfPresent(ProofVerificationMode.self, forKey: .proofVerificationMode)
+        remotePublishState = try c.decodeIfPresent(RemotePublishState.self, forKey: .remotePublishState) ?? .notPublished
         archiveAvailable = try c.decodeIfPresent(Bool.self, forKey: .archiveAvailable) ?? true
     }
 }

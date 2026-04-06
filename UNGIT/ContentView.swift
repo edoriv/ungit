@@ -358,6 +358,9 @@ struct ContentView: View {
                 Button("Quick Milestone") {
                     Task { await store.saveQuickSnapshot(type: .milestone, title: "Milestone") }
                 }
+                Button("Save Milestone and Publish") {
+                    Task { await store.saveQuickMilestoneAndPublish(title: "Milestone") }
+                }
                 Button("Quick Release Candidate") {
                     Task { await store.saveQuickSnapshot(type: .releaseCandidate, title: "Release Candidate") }
                 }
@@ -398,6 +401,18 @@ struct ContentView: View {
                     Task { _ = await store.executePromptCommandIfPresent("UNGIT verify snapshot \(selected.id) archive") }
                 }
                 .disabled(store.selectedEntry == nil)
+            }
+
+            Section("Publish") {
+                Button("Publish Selected Milestone") {
+                    Task { await store.publishSelectedMilestone() }
+                }
+                .disabled(store.selectedEntry?.snapshotType != .milestone)
+
+                Button("Inspect Remote Changes") {
+                    Task { await store.inspectRemoteChangesForSelectedMilestone() }
+                }
+                .disabled(store.selectedEntry?.snapshotType != .milestone)
             }
 
             Section("Utility") {
