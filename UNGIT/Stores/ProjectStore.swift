@@ -36,6 +36,7 @@ final class ProjectStore: ObservableObject {
     @Published var shouldPromptForProjectSummary: Bool = false
     @Published var projectSummaryDraft: String = ""
     @Published var checkpointReminderMessage: String?
+    @Published var latestPublishPreflight: RemotePublishPreflight?
 
     private let initializer = ProjectInitializer()
     private let snapshotService = SnapshotService()
@@ -125,6 +126,72 @@ final class ProjectStore: ObservableObject {
         }
 
         switch command {
+        case .inspectRemoteChanges(let id):
+            var report = ""
+
+            await runOperation {
+                guard let projectURL else { throw AppError.invalidProjectPath }
+                guard let entry = timeline.first(where: { $0.id.uppercased() == id.uppercased() }) else {
+                    throw AppError.commandFailed("Snapshot \(id) was not found.")
+                }
+
+                let review = try snapshotService.createRemoteCorrectionReview(
+                    projectURL: projectURL,
+                    milestoneSnapshotID: entry.id,
+                    requestedBy: "Codex"
+                )
+                try reloadTimelineInternal()
+                selectedEntry = timeline.first(where: { $0.id == review.id }) ?? selectedEntry
+                report = "Remote Correction Review created: \(review.id) linked to milestone \(entry.id)."
+                statusMessage = report
+            }
+
+            if !report.isEmpty {
+                return .info(report: report)
+            }
+            return .failed
+        case .publishMilestone(let id):
+            var report = ""
+
+            await runOperation {
+                guard let projectURL else { throw AppError.invalidProjectPath }
+                guard let entry = timeline.first(where: { $0.id.uppercased() == id.uppercased() }) else {
+                    throw AppError.commandFailed("Snapshot \(id) was not found.")
+                }
+
+                latestPublishPreflight = try snapshotService.publishPreflight(projectURL: projectURL, snapshotID: entry.id)
+                let remote = try snapshotService.publishMilestone(
+                    projectURL: projectURL,
+                    snapshotID: entry.id,
+                    requestedBy: "Codex",
+                    approvedBy: "human"
+                )
+                try reloadTimelineInternal()
+                guard let updated = timeline.first(where: { $0.id == entry.id }) else {
+                    throw AppError.commandFailed("Published milestone \(entry.id), but timeline refresh could not find the updated entry.")
+                }
+                selectedEntry = updated
+                report = "Milestone published: \(updated.id) on \(remote.branchName ?? "unknown-branch") @ \(remote.commitSHA?.prefix(7) ?? "no-sha")."
+                statusMessage = report
+            }
+
+            if !report.isEmpty {
+                return .info(report: report)
+            }
+            return .failed
+        case .showRemoteStatus(let id):
+            guard let entry = timeline.first(where: { $0.id.uppercased() == id.uppercased() }) else {
+                errorMessage = "Snapshot \(id) was not found."
+                return .failed
+            }
+            selectedEntry = entry
+            let remote = selectedManifest?.remoteMetadata
+            let state = remote?.publishState.rawValue ?? entry.remotePublishState.rawValue
+            let branch = remote?.branchName ?? "Not Recorded"
+            let sha = remote?.commitSHA ?? "Not Recorded"
+            let report = "Remote status for \(entry.id): \(state). Branch: \(branch). Commit: \(sha)."
+            statusMessage = report
+            return .info(report: report)
         case .showTimeline:
             do {
                 try reloadTimelineInternal()
@@ -451,6 +518,83 @@ final class ProjectStore: ObservableObject {
         draft.snapshotType = type
         draft.status = quickStatus(for: type)
         await saveSnapshot(draft: draft)
+    }
+
+    func saveQuickMilestoneAndPublish(title: String = "Milestone") async {
+        await runOperation {
+            guard let projectURL, let project else { throw AppError.invalidProjectPath }
+
+            var draft = SnapshotDraft.empty(pathName: project.currentPathName)
+            draft.title = title
+            draft.summary = title
+            draft.snapshotType = .milestone
+            draft.status = .trusted
+            draft.riskLevel = .low
+
+            let entry = try persistSnapshot(draft: draft, projectURL: projectURL, project: project, automatic: false)
+            do {
+                latestPublishPreflight = try snapshotService.publishPreflight(projectURL: projectURL, snapshotID: entry.id)
+                let remote = try snapshotService.publishMilestone(
+                    projectURL: projectURL,
+                    snapshotID: entry.id,
+                    requestedBy: "human",
+                    approvedBy: "human"
+                )
+
+                try reloadTimelineInternal()
+                selectedEntry = timeline.first(where: { $0.id == entry.id }) ?? selectedEntry
+                statusMessage = "Milestone saved and published: \(entry.id) — \(remote.commitSHA?.prefix(7) ?? "no-sha")"
+            } catch {
+                try reloadTimelineInternal()
+                selectedEntry = timeline.first(where: { $0.id == entry.id }) ?? selectedEntry
+                statusMessage = "Milestone saved locally, but publish failed for \(entry.id)."
+                throw error
+            }
+        }
+    }
+
+    func publishSelectedMilestone() async {
+        await runOperation {
+            guard let projectURL, let entry = selectedEntry else {
+                throw AppError.snapshotNotFound
+            }
+
+            do {
+                latestPublishPreflight = try snapshotService.publishPreflight(projectURL: projectURL, snapshotID: entry.id)
+                let remote = try snapshotService.publishMilestone(
+                    projectURL: projectURL,
+                    snapshotID: entry.id,
+                    requestedBy: "human",
+                    approvedBy: "human"
+                )
+
+                try reloadTimelineInternal()
+                selectedEntry = timeline.first(where: { $0.id == entry.id }) ?? selectedEntry
+                statusMessage = "Milestone published: \(entry.id) — \(remote.commitSHA?.prefix(7) ?? "no-sha")"
+            } catch {
+                try reloadTimelineInternal()
+                selectedEntry = timeline.first(where: { $0.id == entry.id }) ?? selectedEntry
+                statusMessage = "Publish failed for milestone \(entry.id)."
+                throw error
+            }
+        }
+    }
+
+    func inspectRemoteChangesForSelectedMilestone() async {
+        await runOperation {
+            guard let projectURL, let entry = selectedEntry else {
+                throw AppError.snapshotNotFound
+            }
+
+            let review = try snapshotService.createRemoteCorrectionReview(
+                projectURL: projectURL,
+                milestoneSnapshotID: entry.id,
+                requestedBy: "human"
+            )
+            try reloadTimelineInternal()
+            selectedEntry = timeline.first(where: { $0.id == review.id }) ?? selectedEntry
+            statusMessage = "Remote Correction Review created: \(review.id)"
+        }
     }
 
     func restoreSelectedSnapshot(approvalToken: String) async {

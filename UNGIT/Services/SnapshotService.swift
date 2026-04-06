@@ -59,6 +59,7 @@ struct SnapshotService {
     private let archiveService = ArchiveService()
     private let processRunner = ProcessRunner()
     private let resourceSnapshotService = ResourceSnapshotService()
+    private let currentStateService = CurrentStateService()
     private let maxProofDetailsLength = 2200
     private let excludedDirectoryNames: Set<String> = [
         ".ungit", "build", ".build", "deriveddata", "dist", "out", "output", "release", "debug"
@@ -122,7 +123,8 @@ struct SnapshotService {
             archivePrunedAt: nil,
             archivePrunedAtISO8601: nil,
             archivePruneReason: nil,
-            archiveLocked: archiveLocked
+            archiveLocked: archiveLocked,
+            remoteMetadata: SnapshotRemoteMetadata()
         )
 
         let manifestRelativePath = try manifestStore.save(manifest, at: layout)
@@ -143,6 +145,8 @@ struct SnapshotService {
             projectFileCount: sizeMetrics.fileCount,
             codeSizeApproxLines: sizeMetrics.codeSizeApproxLines,
             proofVerificationStatus: .unverified,
+            proofVerificationMode: nil,
+            remotePublishState: .notPublished,
             archiveAvailable: true
         )
 
@@ -425,6 +429,234 @@ struct SnapshotService {
         return true
     }
 
+    func publishPreflight(projectURL: URL, snapshotID: String) throws -> RemotePublishPreflight {
+        let layout = ProjectLayout(projectURL: projectURL)
+        let manifests = try manifestStore.loadAllManifests(at: layout)
+        guard let manifest = manifests.first(where: { $0.id == snapshotID }) else {
+            throw AppError.commandFailed("Snapshot \(snapshotID) was not found.")
+        }
+
+        let timeline = try reconcileLogsFromManifests(projectURL: projectURL)
+        let isGitRepository = gitCommandSucceeds(["rev-parse", "--is-inside-work-tree"], projectURL: projectURL)
+        let currentBranch = isGitRepository
+            ? try? trimmedGitOutput(["branch", "--show-current"], projectURL: projectURL)
+            : nil
+        let originRemoteURL = isGitRepository
+            ? try? trimmedGitOutput(["remote", "get-url", "origin"], projectURL: projectURL)
+            : nil
+        let gitStatus = isGitRepository
+            ? try processRunner.runCapturing("/usr/bin/env", ["git", "status", "--porcelain=1", "--ignored"], currentDirectoryURL: projectURL)
+            : CommandResult(exitCode: 1, output: "")
+        let parsedStatus = parseGitStatus(gitStatus.output)
+        let latestSnapshotID = timeline.first?.id
+        let snapshotIsLatest = latestSnapshotID == snapshotID
+        let currentState = try currentStateService.evaluate(projectURL: projectURL, timeline: timeline)
+        let workingTreeDrifted = !snapshotIsLatest || currentState != .matchesLatestSnapshot
+
+        var blockers: [String] = []
+        if manifest.notes.snapshotType != .milestone {
+            blockers.append("Remote publish may only operate on a saved milestone snapshot.")
+        }
+        let archiveURL = layout.ungitURL.appendingPathComponent(manifest.archiveRelativePath, isDirectory: false)
+        if !FileManager.default.fileExists(atPath: archiveURL.path) {
+            blockers.append("Milestone archive is missing.")
+        }
+        if !isGitRepository {
+            blockers.append("Project is not inside a Git repository.")
+        }
+        if (originRemoteURL?.isEmpty ?? true) {
+            blockers.append("Origin remote is missing.")
+        }
+        if (currentBranch?.isEmpty ?? true) {
+            blockers.append("Current branch is unavailable.")
+        }
+        if manifest.remoteMetadata.publishState == .published {
+            blockers.append("This milestone is already published.")
+        }
+
+        return RemotePublishPreflight(
+            snapshotID: manifest.id,
+            snapshotTitle: manifest.notes.title,
+            snapshotType: manifest.notes.snapshotType,
+            isGitRepository: isGitRepository,
+            originRemoteURL: originRemoteURL,
+            currentBranch: currentBranch,
+            snapshotIsLatest: snapshotIsLatest,
+            workingTreeDriftedSinceSnapshot: workingTreeDrifted,
+            stagedChangesPresent: parsedStatus.stagedChangesPresent,
+            unstagedChangesPresent: parsedStatus.unstagedChangesPresent,
+            untrackedFilesPresent: parsedStatus.untrackedFilesPresent,
+            ignoredFilesPresent: parsedStatus.ignoredFilesPresent,
+            publishAllowed: blockers.isEmpty,
+            blockingReasons: blockers
+        )
+    }
+
+    func createRemoteCorrectionReview(
+        projectURL: URL,
+        milestoneSnapshotID: String,
+        requestedBy: String,
+        selectedAction: RemoteCorrectionSelectedAction = .inspectOnly,
+        codexRecommendation: String? = nil
+    ) throws -> TimelineEntry {
+        let layout = ProjectLayout(projectURL: projectURL)
+        let manifests = try manifestStore.loadAllManifests(at: layout)
+        guard let milestoneManifest = manifests.first(where: { $0.id == milestoneSnapshotID }) else {
+            throw AppError.commandFailed("Snapshot \(milestoneSnapshotID) was not found.")
+        }
+        guard milestoneManifest.notes.snapshotType == .milestone else {
+            throw AppError.commandFailed("Remote Correction Review can only be created for a milestone snapshot.")
+        }
+
+        let remotePath = remotePublishPath(for: milestoneManifest).trimmedOr("origin/unknown")
+        let reason = classifyRemotePublishFailure(
+            message: milestoneManifest.remoteMetadata.lastPublishError,
+            preflight: milestoneManifest.remoteMetadata.latestPreflight
+        )
+
+        let tempRoot = layout.tempURL.appendingPathComponent("remote-correction-review-\(milestoneSnapshotID)-\(UUID().uuidString)", isDirectory: true)
+        let localExtractURL = tempRoot.appendingPathComponent("local-milestone", isDirectory: true)
+        let remoteCloneURL = tempRoot.appendingPathComponent("remote-path", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        try FileSystemService().ensureDirectory(tempRoot)
+
+        let archiveURL = layout.ungitURL.appendingPathComponent(milestoneManifest.archiveRelativePath, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: archiveURL.path) else {
+            throw AppError.commandFailed("Milestone archive is missing. Remote Correction Review needs the saved milestone snapshot.")
+        }
+
+        let localReviewRoot = try archiveService.extractSnapshotArchive(archiveURL: archiveURL, destinationURL: localExtractURL)
+        let remoteReviewRoot = try importRemotePathForReview(projectURL: projectURL, remoteURL: milestoneManifest.remoteMetadata.latestPreflight?.originRemoteURL, branchName: milestoneManifest.remoteMetadata.branchName, destinationURL: remoteCloneURL)
+        let changedFiles = try compareProjectTrees(localURL: localReviewRoot, remoteURL: remoteReviewRoot)
+        let summary = summarizeRemoteCorrection(changedFiles: changedFiles, remotePath: remotePath)
+        let recommendationLevel = recommendationLevel(for: changedFiles, reason: reason)
+
+        var reviewNotes = SnapshotNotes(
+            title: "Remote Correction Review",
+            summary: "Review remote divergence safely for milestone \(milestoneManifest.id).",
+            whatChanged: summary,
+            why: "Blocked publish needs safe inspection before any correction decision.",
+            importantFilesTouched: changedFiles.map(\.path),
+            gotchas: "This review imported remote changes into an isolated inspection space. No live project files were modified.",
+            tags: ["remote-correction-review", "publish-blocked", "remote-review"],
+            status: .working,
+            snapshotType: .remoteCorrectionReview,
+            pathName: milestoneManifest.notes.pathName,
+            proofCommand: "",
+            linkedMemoryIDs: [milestoneManifest.id],
+            changeIntent: "Inspect remote divergence without changing live local truth.",
+            riskLevel: recommendationLevel == .risky ? .high : (recommendationLevel == .caution ? .medium : .low),
+            outcome: nil
+        )
+        reviewNotes.summary = summary
+
+        let projectMetadata = try JSONFileStore().read(ProjectMetadata.self, from: layout.projectMetadataURL)
+        let entry = try saveSnapshot(
+            projectURL: projectURL,
+            project: projectMetadata,
+            notes: reviewNotes,
+            isAutomaticSafetySnapshot: false
+        )
+
+        var savedManifest = try manifestStore.loadManifest(projectURL: projectURL, relativePath: entry.manifestRelativePath)
+        let reviewedAt = Date()
+        savedManifest.remoteCorrectionReview = RemoteCorrectionReviewRecord(
+            linkedMilestoneSnapshotID: milestoneManifest.id,
+            reasonForReview: reason,
+            remotePath: remotePath,
+            changedFiles: changedFiles,
+            summaryOfRemoteChanges: summary,
+            codexRecommendation: codexRecommendation ?? defaultCodexRecommendation(for: changedFiles, reason: reason, remotePath: remotePath),
+            recommendationLevel: recommendationLevel,
+            humanSelectedNextAction: selectedAction,
+            reviewedAt: reviewedAt,
+            reviewedAtISO8601: DateFormatters.iso8601.string(from: reviewedAt)
+        )
+        _ = try manifestStore.save(savedManifest, at: layout)
+        _ = try reconcileLogsFromManifests(projectURL: projectURL)
+        return entry
+    }
+
+    @discardableResult
+    func publishMilestone(
+        projectURL: URL,
+        snapshotID: String,
+        requestedBy: String,
+        approvedBy: String,
+        executedBy: String = "UNGIT"
+    ) throws -> SnapshotRemoteMetadata {
+        let layout = ProjectLayout(projectURL: projectURL)
+        let manifests = try manifestStore.loadAllManifests(at: layout)
+        guard let manifestIndex = manifests.firstIndex(where: { $0.id == snapshotID }) else {
+            throw AppError.commandFailed("Snapshot \(snapshotID) was not found.")
+        }
+
+        let preflight = try publishPreflight(projectURL: projectURL, snapshotID: snapshotID)
+        var manifest = manifests[manifestIndex]
+        let attemptAt = Date()
+        let attemptISO = DateFormatters.iso8601.string(from: attemptAt)
+        let branchName = preflight.currentBranch?.trimmed
+
+        manifest.remoteMetadata.latestPreflight = preflight
+        manifest.remoteMetadata.lastPublishAttemptAt = attemptAt
+        manifest.remoteMetadata.lastPublishAttemptAtISO8601 = attemptISO
+        manifest.remoteMetadata.requestedBy = requestedBy
+        manifest.remoteMetadata.approvedBy = approvedBy
+        manifest.remoteMetadata.executedBy = executedBy
+        manifest.remoteMetadata.branchName = branchName
+
+        guard preflight.publishAllowed else {
+            manifest.remoteMetadata.publishState = .publishFailed
+            manifest.remoteMetadata.lastPublishError = preflight.blockingReasons.joined(separator: " ")
+            _ = try manifestStore.save(manifest, at: layout)
+            _ = try reconcileLogsFromManifests(projectURL: projectURL)
+            throw AppError.commandFailed(manifest.remoteMetadata.lastPublishError ?? "Publish preflight failed.")
+        }
+
+        let publicationWindow = try buildPublicationWindow(targetSnapshotID: snapshotID, manifests: manifests)
+
+        manifest.remoteMetadata.publishState = .publishing
+        manifest.remoteMetadata.publicationWindow = publicationWindow
+        manifest.remoteMetadata.lastPublishError = nil
+        _ = try manifestStore.save(manifest, at: layout)
+
+        do {
+            let subject = "Milestone: \(manifest.notes.title)"
+            let body = commitBody(for: manifest, publicationWindow: publicationWindow)
+            let archiveURL = layout.ungitURL.appendingPathComponent(manifest.archiveRelativePath, isDirectory: false)
+            guard let remoteURL = preflight.originRemoteURL?.trimmed, !remoteURL.isEmpty else {
+                throw AppError.commandFailed("Origin remote is missing.")
+            }
+            guard let branchName, !branchName.isEmpty else {
+                throw AppError.commandFailed("Current branch is unavailable.")
+            }
+
+            let commitSHA = try publishSnapshotArchive(
+                projectURL: projectURL,
+                archiveURL: archiveURL,
+                remoteURL: remoteURL,
+                branchName: branchName,
+                commitSubject: subject,
+                commitBody: body
+            )
+            let publishedAt = Date()
+            manifest.remoteMetadata.publishState = .published
+            manifest.remoteMetadata.commitSHA = commitSHA
+            manifest.remoteMetadata.publishedAt = publishedAt
+            manifest.remoteMetadata.publishedAtISO8601 = DateFormatters.iso8601.string(from: publishedAt)
+            manifest.remoteMetadata.lastPublishError = nil
+            _ = try manifestStore.save(manifest, at: layout)
+            _ = try reconcileLogsFromManifests(projectURL: projectURL)
+            return manifest.remoteMetadata
+        } catch {
+            manifest.remoteMetadata.publishState = .publishFailed
+            manifest.remoteMetadata.lastPublishError = error.localizedDescription
+            _ = try manifestStore.save(manifest, at: layout)
+            _ = try reconcileLogsFromManifests(projectURL: projectURL)
+            throw error
+        }
+    }
+
     @discardableResult
     func reconcileLogsFromManifests(projectURL: URL) throws -> [TimelineEntry] {
         let layout = ProjectLayout(projectURL: projectURL)
@@ -459,8 +691,364 @@ struct SnapshotService {
             projectFileCount: manifest.projectSizeMetrics?.fileCount,
             codeSizeApproxLines: manifest.projectSizeMetrics?.codeSizeApproxLines,
             proofVerificationStatus: manifest.proofVerificationStatus,
+            proofVerificationMode: manifest.proofVerificationMode,
+            remotePublishState: manifest.remoteMetadata.publishState,
             archiveAvailable: archiveAvailable
         )
+    }
+
+    private func buildPublicationWindow(
+        targetSnapshotID: String,
+        manifests: [SnapshotManifest]
+    ) throws -> MilestonePublicationWindow {
+        let ordered = manifests.sorted { $0.createdAt < $1.createdAt }
+        guard let targetIndex = ordered.firstIndex(where: { $0.id == targetSnapshotID }) else {
+            throw AppError.commandFailed("Publication window could not find snapshot \(targetSnapshotID).")
+        }
+
+        let previousPublishedIndex = ordered[..<targetIndex].lastIndex(where: {
+            $0.notes.snapshotType == .milestone && $0.remoteMetadata.publishState == .published
+        })
+        let startIndex = (previousPublishedIndex ?? -1) + 1
+        let included = ordered[startIndex...targetIndex]
+            .filter { !$0.isAutomaticSafetySnapshot }
+
+        let previousPublishedMilestoneID = previousPublishedIndex.map { ordered[$0].id }
+        let firstIncludedSnapshotID = included.first?.id
+        let lastIncludedSnapshotID = included.last?.id
+        let includedSnapshotIDs = included.map(\.id)
+        let compiledChangelog = renderCompiledChangelog(from: included)
+
+        return MilestonePublicationWindow(
+            previousPublishedMilestoneID: previousPublishedMilestoneID,
+            firstIncludedSnapshotID: firstIncludedSnapshotID,
+            lastIncludedSnapshotID: lastIncludedSnapshotID,
+            includedSnapshotIDs: includedSnapshotIDs,
+            compiledChangelog: compiledChangelog
+        )
+    }
+
+    private func publishSnapshotArchive(
+        projectURL: URL,
+        archiveURL: URL,
+        remoteURL: String,
+        branchName: String,
+        commitSubject: String,
+        commitBody: String
+    ) throws -> String {
+        let layout = ProjectLayout(projectURL: projectURL)
+        let publishRoot = layout.tempURL.appendingPathComponent("publish-\(UUID().uuidString)", isDirectory: true)
+        let extractedArchiveURL = publishRoot.appendingPathComponent("milestone-archive", isDirectory: true)
+        let remoteCloneURL = publishRoot.appendingPathComponent("remote-clone", isDirectory: true)
+        let fileSystem = FileSystemService()
+
+        defer { try? FileManager.default.removeItem(at: publishRoot) }
+        try fileSystem.ensureDirectory(publishRoot)
+
+        let archiveProjectRoot = try archiveService.extractSnapshotArchive(archiveURL: archiveURL, destinationURL: extractedArchiveURL)
+        try cloneRemoteForPublish(
+            projectURL: projectURL,
+            remoteURL: remoteURL,
+            branchName: branchName,
+            destinationURL: remoteCloneURL
+        )
+        try synchronizePublishedContents(
+            sourceRootURL: archiveProjectRoot,
+            destinationRootURL: remoteCloneURL
+        )
+        try configureGitIdentityForPublish(sourceProjectURL: projectURL, publishCloneURL: remoteCloneURL)
+        try processRunner.run("/usr/bin/env", ["git", "add", "-A"], currentDirectoryURL: remoteCloneURL)
+        let stagedStatus = try processRunner.runCapturing("/usr/bin/env", ["git", "status", "--porcelain=1"], currentDirectoryURL: remoteCloneURL)
+        if stagedStatus.output.trimmed.isEmpty {
+            return try trimmedGitOutput(["rev-parse", "HEAD"], projectURL: remoteCloneURL)
+        }
+        try processRunner.run("/usr/bin/env", ["git", "commit", "-m", commitSubject, "-m", commitBody], currentDirectoryURL: remoteCloneURL)
+        try processRunner.run("/usr/bin/env", ["git", "push", "origin", branchName], currentDirectoryURL: remoteCloneURL)
+        return try trimmedGitOutput(["rev-parse", "HEAD"], projectURL: remoteCloneURL)
+    }
+
+    private func cloneRemoteForPublish(
+        projectURL: URL,
+        remoteURL: String,
+        branchName: String,
+        destinationURL: URL
+    ) throws {
+        let fileSystem = FileSystemService()
+        try fileSystem.ensureDirectory(destinationURL)
+        try fileSystem.clearDirectory(destinationURL)
+        try processRunner.run("/usr/bin/env", ["git", "clone", "--depth", "1", remoteURL, destinationURL.path], currentDirectoryURL: projectURL)
+
+        if gitCommandSucceeds(["rev-parse", "--verify", "origin/\(branchName)"], projectURL: destinationURL) {
+            try processRunner.run("/usr/bin/env", ["git", "checkout", "-B", branchName, "origin/\(branchName)"], currentDirectoryURL: destinationURL)
+        } else {
+            try processRunner.run("/usr/bin/env", ["git", "checkout", "-B", branchName], currentDirectoryURL: destinationURL)
+        }
+    }
+
+    private func synchronizePublishedContents(
+        sourceRootURL: URL,
+        destinationRootURL: URL
+    ) throws {
+        let fileSystem = FileSystemService()
+        try fileSystem.removeContents(of: destinationRootURL, excludingRootNames: [".git"])
+        try fileSystem.copyProjectContents(
+            from: sourceRootURL,
+            to: destinationRootURL,
+            excludingRootNames: [".git", ".ungit"]
+        )
+    }
+
+    private func configureGitIdentityForPublish(
+        sourceProjectURL: URL,
+        publishCloneURL: URL
+    ) throws {
+        let userName = (try? trimmedGitOutput(["config", "user.name"], projectURL: sourceProjectURL)).flatMap { $0.trimmed.isEmpty ? nil : $0 } ?? "UNGIT"
+        let userEmail = (try? trimmedGitOutput(["config", "user.email"], projectURL: sourceProjectURL)).flatMap { $0.trimmed.isEmpty ? nil : $0 } ?? "ungit@local.invalid"
+        try processRunner.run("/usr/bin/env", ["git", "config", "user.name", userName], currentDirectoryURL: publishCloneURL)
+        try processRunner.run("/usr/bin/env", ["git", "config", "user.email", userEmail], currentDirectoryURL: publishCloneURL)
+    }
+
+    private func importRemotePathForReview(
+        projectURL: URL,
+        remoteURL: String?,
+        branchName: String?,
+        destinationURL: URL
+    ) throws -> URL {
+        guard let remoteURL, !remoteURL.trimmed.isEmpty else {
+            throw AppError.commandFailed("Remote Correction Review could not locate the selected remote path.")
+        }
+        guard let branchName, !branchName.trimmed.isEmpty else {
+            throw AppError.commandFailed("Remote Correction Review could not determine the selected remote path branch.")
+        }
+
+        try FileSystemService().ensureDirectory(destinationURL)
+        try FileSystemService().clearDirectory(destinationURL)
+        try processRunner.run(
+            "/usr/bin/env",
+            ["git", "clone", "--depth", "1", "--branch", branchName, remoteURL, destinationURL.path],
+            currentDirectoryURL: projectURL
+        )
+        return destinationURL
+    }
+
+    private func compareProjectTrees(localURL: URL, remoteURL: URL) throws -> [RemoteCorrectionChangedFile] {
+        let localFiles = try relativeFileMap(rootURL: localURL, excludingRootNames: [".git", ".ungit"])
+        let remoteFiles = try relativeFileMap(rootURL: remoteURL, excludingRootNames: [".git", ".ungit"])
+        let allPaths = Set(localFiles.keys).union(remoteFiles.keys).sorted()
+
+        return try allPaths.compactMap { path in
+            let local = localFiles[path]
+            let remote = remoteFiles[path]
+
+            switch (local, remote) {
+            case (nil, .some):
+                return RemoteCorrectionChangedFile(path: path, status: .added)
+            case (.some, nil):
+                return RemoteCorrectionChangedFile(path: path, status: .deleted)
+            case let (.some(localURL), .some(remoteURL)):
+                let localData = try Data(contentsOf: localURL)
+                let remoteData = try Data(contentsOf: remoteURL)
+                guard localData != remoteData else { return nil }
+                return RemoteCorrectionChangedFile(path: path, status: .modified)
+            default:
+                return nil
+            }
+        }
+    }
+
+    private func relativeFileMap(rootURL: URL, excludingRootNames: Set<String>) throws -> [String: URL] {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in true }
+        ) else {
+            return [:]
+        }
+
+        var results: [String: URL] = [:]
+        for case let itemURL as URL in enumerator {
+            let relativePath = itemURL.path.replacingOccurrences(of: rootURL.path + "/", with: "")
+            if itemURL.pathComponents.contains(where: { excludingRootNames.contains($0) }) {
+                continue
+            }
+            let values = try itemURL.resourceValues(forKeys: [.isRegularFileKey])
+            guard values.isRegularFile == true else { continue }
+            results[relativePath] = itemURL
+        }
+        return results
+    }
+
+    private func summarizeRemoteCorrection(changedFiles: [RemoteCorrectionChangedFile], remotePath: String) -> String {
+        let added = changedFiles.filter { $0.status == .added }.count
+        let modified = changedFiles.filter { $0.status == .modified }.count
+        let deleted = changedFiles.filter { $0.status == .deleted }.count
+        let sample = changedFiles.prefix(8).map { "\($0.status.rawValue): \($0.path)" }.joined(separator: "; ")
+        let sampleText = sample.isEmpty ? "No file-level delta was detected." : sample
+        return "Remote path \(remotePath) differs from the saved milestone snapshot. Added \(added), modified \(modified), deleted \(deleted). Sample: \(sampleText)"
+    }
+
+    private func recommendationLevel(
+        for changedFiles: [RemoteCorrectionChangedFile],
+        reason: RemotePublishFailureReason
+    ) -> RemoteCorrectionRecommendationLevel {
+        if reason == .remotePathDiverged {
+            return changedFiles.count > 12 ? .risky : .caution
+        }
+        return changedFiles.count > 20 ? .risky : .caution
+    }
+
+    private func defaultCodexRecommendation(
+        for changedFiles: [RemoteCorrectionChangedFile],
+        reason: RemotePublishFailureReason,
+        remotePath: String
+    ) -> String {
+        switch reason {
+        case .remotePathDiverged:
+            return "Remote change can block distribution without invalidating local truth. Review the imported delta from \(remotePath), then prefer publishing this milestone to a new path unless the remote correction clearly matches your intended milestone story."
+        default:
+            return "Inspect the imported remote delta first. Keep local milestone truth unchanged until a human chooses whether to ignore it, adopt it later, or publish to a new path."
+        }
+    }
+
+    private func remotePublishPath(for manifest: SnapshotManifest) -> String {
+        let branch = manifest.remoteMetadata.branchName?.trimmed
+        if let branch, !branch.isEmpty {
+            return "origin/\(branch)"
+        }
+        if let branch = manifest.remoteMetadata.latestPreflight?.currentBranch?.trimmed, !branch.isEmpty {
+            return "origin/\(branch)"
+        }
+        return manifest.remoteMetadata.latestPreflight?.originRemoteURL?.trimmedOr("origin/unknown") ?? "origin/unknown"
+    }
+
+    private func classifyRemotePublishFailure(
+        message: String?,
+        preflight: RemotePublishPreflight?
+    ) -> RemotePublishFailureReason {
+        let lower = message?.lowercased() ?? ""
+
+        if let preflight {
+            if !preflight.isGitRepository {
+                return .noGitRepository
+            }
+            if !preflight.publishAllowed {
+                if preflight.workingTreeDriftedSinceSnapshot {
+                    return .workspaceDriftDetected
+                }
+                if preflight.originRemoteURL?.isEmpty ?? true {
+                    return .remoteMissing
+                }
+            }
+        }
+
+        if lower.contains("non-fast-forward") || lower.contains("tip of your current branch is behind") {
+            return .remotePathDiverged
+        }
+        if lower.contains("authentication failed") || lower.contains("could not read username") || lower.contains("permission denied") {
+            return .remoteAuthFailed
+        }
+        if lower.contains("remote") && lower.contains("not found") {
+            return .remoteMissing
+        }
+        if lower.contains("drifted") {
+            return .workspaceDriftDetected
+        }
+        if !lower.isEmpty {
+            return .publishBlocked
+        }
+        return .unknown
+    }
+
+    private func renderCompiledChangelog(from manifests: [SnapshotManifest]) -> String {
+        guard !manifests.isEmpty else { return "No milestone notes were available to compile." }
+
+        var lines: [String] = []
+        lines.append("Compiled from UNGIT snapshot notes since the previous published milestone.")
+        lines.append("")
+
+        for manifest in manifests {
+            let notes = manifest.notes
+            lines.append("[\(notes.snapshotType.rawValue)] \(notes.title) (\(manifest.id))")
+            if !notes.summary.trimmed.isEmpty {
+                lines.append("Summary: \(notes.summary.trimmed)")
+            }
+            if !notes.whatChanged.trimmed.isEmpty {
+                lines.append("What Changed: \(notes.whatChanged.trimmed)")
+            }
+            if !notes.why.trimmed.isEmpty {
+                lines.append("Why: \(notes.why.trimmed)")
+            }
+            if !notes.changeIntent.trimmed.isEmpty {
+                lines.append("Change Intent: \(notes.changeIntent.trimmed)")
+            }
+            lines.append("")
+        }
+
+        return lines.joined(separator: "\n").trimmed
+    }
+
+    private func commitBody(for manifest: SnapshotManifest, publicationWindow: MilestonePublicationWindow) -> String {
+        var lines: [String] = []
+        lines.append("UNGIT Milestone Snapshot: \(manifest.id)")
+        lines.append("Publication Window:")
+        lines.append("- Previous Published Milestone ID: \(publicationWindow.previousPublishedMilestoneID ?? "-")")
+        lines.append("- First Included Snapshot ID: \(publicationWindow.firstIncludedSnapshotID ?? "-")")
+        lines.append("- Last Included Snapshot ID: \(publicationWindow.lastIncludedSnapshotID ?? "-")")
+        lines.append("- Included Snapshot IDs: \(publicationWindow.includedSnapshotIDs.joined(separator: ", "))")
+        lines.append("")
+        lines.append(publicationWindow.compiledChangelog)
+        return lines.joined(separator: "\n")
+    }
+
+    private func trimmedGitOutput(_ arguments: [String], projectURL: URL) throws -> String {
+        let result = try processRunner.runCapturing("/usr/bin/env", ["git"] + arguments, currentDirectoryURL: projectURL)
+        guard result.exitCode == 0 else {
+            throw AppError.commandFailed(result.output.trimmedOr("git \(arguments.joined(separator: " ")) failed"))
+        }
+        return result.output.trimmed
+    }
+
+    private func gitCommandSucceeds(_ arguments: [String], projectURL: URL) -> Bool {
+        guard let result = try? processRunner.runCapturing("/usr/bin/env", ["git"] + arguments, currentDirectoryURL: projectURL) else {
+            return false
+        }
+        return result.exitCode == 0
+    }
+
+    private func parseGitStatus(_ output: String) -> (
+        stagedChangesPresent: Bool,
+        unstagedChangesPresent: Bool,
+        untrackedFilesPresent: Bool,
+        ignoredFilesPresent: Bool
+    ) {
+        var staged = false
+        var unstaged = false
+        var untracked = false
+        var ignored = false
+
+        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
+            guard line.count >= 2 else { continue }
+            let x = line[line.startIndex]
+            let y = line[line.index(after: line.startIndex)]
+            if x == "?" && y == "?" {
+                untracked = true
+                continue
+            }
+            if x == "!" && y == "!" {
+                ignored = true
+                continue
+            }
+            if x != " " {
+                staged = true
+            }
+            if y != " " {
+                unstaged = true
+            }
+        }
+
+        return (staged, unstaged, untracked, ignored)
     }
 
     private func normalizedForkPointTextIfNeeded(_ text: String, tags: [String]) -> String {

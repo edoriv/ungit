@@ -315,6 +315,103 @@ final class UngitToolRouterTests: XCTestCase {
         XCTAssertFalse(result.allPassed)
     }
 
+    func testPublishMilestoneUsesSavedSnapshotEvenWhenWorkspaceHasDrifted() throws {
+        let projectURL = try makeInitializedProject(named: "PublishFromSavedMilestone")
+        defer { try? FileManager.default.removeItem(at: projectURL) }
+
+        let runner = ProcessRunner()
+        try runner.run("/usr/bin/env", ["git", "init", "-b", "main"], currentDirectoryURL: projectURL)
+        try runner.run("/usr/bin/env", ["git", "config", "user.name", "Test User"], currentDirectoryURL: projectURL)
+        try runner.run("/usr/bin/env", ["git", "config", "user.email", "test@example.com"], currentDirectoryURL: projectURL)
+        try write(
+            """
+            .ungit/
+            AGENTS.md
+            BUGS.md
+            IDEAS.md
+            PARK.md
+            PROJECT_SUMMARY.md
+            RESTORE_DRILLS.md
+            TODO.md
+            """,
+            to: projectURL.appendingPathComponent(".gitignore", isDirectory: false)
+        )
+        try runner.run("/usr/bin/env", ["git", "add", "-A"], currentDirectoryURL: projectURL)
+        try runner.run("/usr/bin/env", ["git", "commit", "-m", "Initial commit"], currentDirectoryURL: projectURL)
+
+        let remoteURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("ungit-remote-\(UUID().uuidString).git", isDirectory: true)
+        try runner.run("/usr/bin/env", ["git", "init", "--bare", remoteURL.path])
+        try runner.run("/usr/bin/env", ["git", "remote", "add", "origin", remoteURL.path], currentDirectoryURL: projectURL)
+        try runner.run("/usr/bin/env", ["git", "push", "-u", "origin", "main"], currentDirectoryURL: projectURL)
+        defer { try? FileManager.default.removeItem(at: remoteURL) }
+
+        let payloadURL = projectURL.appendingPathComponent("MilestonePayload.txt", isDirectory: false)
+        try write("Saved milestone payload\n", to: payloadURL)
+
+        let initializer = ProjectInitializer()
+        let project = try initializer.loadProject(at: projectURL)
+        let snapshotService = SnapshotService()
+        let notes = SnapshotNotes(
+            title: "Milestone",
+            summary: "Milestone",
+            whatChanged: "Capture saved milestone state.",
+            why: "Verify remote publish uses the saved snapshot archive.",
+            importantFilesTouched: ["MilestonePayload.txt"],
+            gotchas: "",
+            tags: [],
+            status: .trusted,
+            snapshotType: .milestone,
+            pathName: "main",
+            proofCommand: "",
+            linkedMemoryIDs: [],
+            changeIntent: "Publish the saved milestone rather than the live workspace.",
+            riskLevel: .low,
+            outcome: nil
+        )
+        let entry = try snapshotService.saveSnapshot(projectURL: projectURL, project: project, notes: notes)
+
+        let archiveURL = ProjectLayout(projectURL: projectURL).ungitURL.appendingPathComponent(entry.archiveRelativePath, isDirectory: false)
+        let archiveInspectURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("ungit-archive-inspect-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: archiveInspectURL) }
+        let extractedArchiveRoot = try ArchiveService().extractSnapshotArchive(
+            archiveURL: archiveURL,
+            destinationURL: archiveInspectURL
+        )
+        let archivedPayload = try String(contentsOf: extractedArchiveRoot.appendingPathComponent("MilestonePayload.txt", isDirectory: false), encoding: .utf8)
+        XCTAssertEqual(archivedPayload, "Saved milestone payload\n")
+
+        Thread.sleep(forTimeInterval: 1.2)
+        try write("Drifted local payload\n", to: payloadURL)
+        try runner.run("/usr/bin/env", ["git", "add", "MilestonePayload.txt"], currentDirectoryURL: projectURL)
+        try runner.run("/usr/bin/env", ["git", "commit", "-m", "Local drift"], currentDirectoryURL: projectURL)
+
+        let preflight = try snapshotService.publishPreflight(projectURL: projectURL, snapshotID: entry.id)
+        XCTAssertTrue(preflight.publishAllowed)
+        XCTAssertTrue(preflight.workingTreeDriftedSinceSnapshot)
+        XCTAssertFalse(preflight.stagedChangesPresent)
+        XCTAssertFalse(preflight.unstagedChangesPresent)
+        XCTAssertFalse(preflight.untrackedFilesPresent)
+
+        let remote = try snapshotService.publishMilestone(
+            projectURL: projectURL,
+            snapshotID: entry.id,
+            requestedBy: "test",
+            approvedBy: "test"
+        )
+        XCTAssertEqual(remote.publishState, .published)
+        XCTAssertNotNil(remote.commitSHA)
+
+        let verificationClone = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("ungit-verify-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: verificationClone) }
+        try runner.run("/usr/bin/env", ["git", "clone", "--depth", "1", "--branch", "main", remoteURL.path, verificationClone.path])
+
+        let publishedPayload = try String(contentsOf: verificationClone.appendingPathComponent("MilestonePayload.txt", isDirectory: false), encoding: .utf8)
+        XCTAssertEqual(publishedPayload, "Saved milestone payload\n")
+    }
+
     @MainActor
     func testProjectStoreQuickSaveCommandWritesManifestAndArchive() async throws {
         let projectURL = try makeInitializedProject(named: "AppPathQuickSave")

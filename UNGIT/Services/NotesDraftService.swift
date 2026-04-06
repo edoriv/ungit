@@ -50,6 +50,9 @@ enum UngitCommand {
     case quick(kind: UngitQuickCommandKind, title: String?)
     case verifySnapshot(id: String, mode: ProofVerificationMode?)
     case verifyLatest(kind: UngitVerifyLatestKind, mode: ProofVerificationMode?)
+    case publishMilestone(id: String)
+    case inspectRemoteChanges(id: String)
+    case showRemoteStatus(id: String)
     case showTimeline
     case showSnapshot(id: String)
     case handoff
@@ -110,6 +113,10 @@ struct NotesDraftService {
         }
 
         if let parsed = parseVerifyCommand(from: body) {
+            return parsed
+        }
+
+        if let parsed = parseRemoteCommand(from: body) {
             return parsed
         }
 
@@ -470,6 +477,42 @@ struct NotesDraftService {
         }
     }
 
+    private func parseRemoteCommand(from body: String) -> UngitCommand? {
+        let trimmed = body.trimmed
+
+        let publishPattern = #"(?i)^publish\s+milestone\s+([A-F0-9\-]+)$"#
+        if let regex = try? NSRegularExpression(pattern: publishPattern) {
+            let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            if let match = regex.firstMatch(in: trimmed, options: [], range: range) {
+                let rawID = capture(match: match, in: trimmed, index: 1).trimmed.uppercased()
+                guard !rawID.isEmpty else { return nil }
+                return .publishMilestone(id: rawID)
+            }
+        }
+
+        let inspectPattern = #"(?i)^inspect\s+remote\s+changes\s+([A-F0-9\-]+)$"#
+        if let regex = try? NSRegularExpression(pattern: inspectPattern) {
+            let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            if let match = regex.firstMatch(in: trimmed, options: [], range: range) {
+                let rawID = capture(match: match, in: trimmed, index: 1).trimmed.uppercased()
+                guard !rawID.isEmpty else { return nil }
+                return .inspectRemoteChanges(id: rawID)
+            }
+        }
+
+        let showPattern = #"(?i)^show\s+remote\s+status\s+([A-F0-9\-]+)$"#
+        if let regex = try? NSRegularExpression(pattern: showPattern) {
+            let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            if let match = regex.firstMatch(in: trimmed, options: [], range: range) {
+                let rawID = capture(match: match, in: trimmed, index: 1).trimmed.uppercased()
+                guard !rawID.isEmpty else { return nil }
+                return .showRemoteStatus(id: rawID)
+            }
+        }
+
+        return nil
+    }
+
     private func parseProofMode(_ raw: String) -> ProofVerificationMode? {
         switch raw {
         case "archive":
@@ -522,7 +565,7 @@ struct NotesDraftService {
             return .high
         case .milestone, .trustedRollback, .releaseCandidate, .release, .cleanup:
             return .low
-        case .featureWorks, .fix:
+        case .featureWorks, .fix, .remoteCorrectionReview:
             return .medium
         }
     }
